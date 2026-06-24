@@ -103,13 +103,13 @@ export async function processTurn(
 
     // Still extract signals for research purposes (even in escalation)
     const signalSet = extractSignals(userTurn.id, userText, history)
-    const stateEstimate = { state: 'ESCALATION' as const, confidence: 1.0, reasoning: 'Safety prescreen escalation' }
+    const stateEstimate = { state: 'ESCALATION' as const, confidence: 1.0, rationale: 'Safety prescreen escalation', signals_used: [] as import('@/types/domain').SignalType[] }
 
     const generation: Generation = {
       turn_id: aiTurn.id,
       move_directive: handoffDirective,
-      model_id: 'mock-template-v1',
-      prompt_version: 'milestone-1',
+      model_id: 'template-v2',
+      prompt_version: 'milestone-2',
       output_text: handoffText,
       postcheck_results: { passed: true, flags: [] },
     }
@@ -134,7 +134,8 @@ export async function processTurn(
   const moveDirective = selectMove(stateEstimate, signalSet.signals, history, userText)
 
   // ── Step 5: Generation ────────────────────────────────────────────────────
-  const generatorOutput = generate(moveDirective, userText)
+  const turnCount = history.filter((t) => t.speaker === 'AI').length
+  const generatorOutput = generate(moveDirective, userText, turnCount)
 
   // ── Step 6: Safety postscreen ─────────────────────────────────────────────
   let postcheckResults = postscreen(generatorOutput.output_text)
@@ -169,13 +170,19 @@ export async function processTurn(
   store.appendTurn(aiTurn)
 
   // ── Step 8: Log ───────────────────────────────────────────────────────────
+  // Merge generator constraint violations into postcheck flags
+  const mergedPostcheck = {
+    passed: postcheckResults.passed && generatorOutput.constraint_violations.length === 0,
+    flags: [...postcheckResults.flags, ...generatorOutput.constraint_violations],
+  }
+
   const generation: Generation = {
     turn_id: aiTurn.id,
     move_directive: moveDirective,
     model_id: generatorOutput.model_id,
     prompt_version: generatorOutput.prompt_version,
     output_text: finalText,
-    postcheck_results: postcheckResults,
+    postcheck_results: mergedPostcheck,
   }
 
   const trace = logTurn({

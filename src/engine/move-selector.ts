@@ -1,43 +1,43 @@
 /**
- * Move Selector — the Policy. The engine's core.
+ * Move Selector v1 — the Policy. The engine's core.
  *
  * Blueprint §5: "Maps (state, signals, safety constraints, history) →
  * MoveDirective. Encodes the philosophy as inspectable logic."
  *
- * Selection logic follows the 10-rule ordered sequence from §5.2.
- * The two hard-coded philosophy biases (§5.3):
- *   1. Bias to exit under uncertainty — when state confidence is low and
- *      the choice is deepen vs orient/stop, choose orient/stop.
- *   2. Reflection over interrogation — once the person is genuinely working,
- *      default to reflecting rather than stacking questions.
+ * Selection logic: 10-rule ordered sequence from §5.2.
+ * Two hard-coded philosophy biases (§5.3):
+ *   1. Bias to exit under uncertainty — when confidence is low and the
+ *      choice is "deepen vs stop", choose stop.
+ *   2. Reflection over interrogation — once the person is genuinely
+ *      working, default to reflecting rather than stacking questions.
  *
- * This is rule-based for v1. The policy_version label tracks which version
- * of these rules produced a given decision — essential for the lab.
+ * policy_version tracks which rule set produced each logged decision.
  */
 
 import type {
   AlternativeConsidered,
-  ConversationState,
   MoveConstraints,
   MoveDirective,
   MoveType,
   Signal,
+  SignalType,
   Turn,
 } from '@/types/domain'
 import type { StateEstimate } from './state-estimator'
 
-export const POLICY_VERSION = 'rule-based-v1'
+export const POLICY_VERSION = 'rule-based-v2'
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Constraints table ────────────────────────────────────────────────────────
 
-function getSignal(signals: Signal[], type: Signal['type']): Signal | undefined {
-  return signals.find((s) => s.type === type)
-}
-
-function defaultConstraints(move: MoveType): MoveConstraints {
-  const isReturnable = ['REFLECTION', 'NAMING', 'CLARIFICATION', 'GENTLE_CHALLENGE', 'SUMMARY', 'RECONNECTION'].includes(move)
-  const noAdvice = ['REFLECTION', 'NAMING', 'HOLDING', 'CLARIFICATION', 'QUESTION'].includes(move)
-  const isHalfStep = ['NAMING', 'GENTLE_CHALLENGE'].includes(move)
+/** Exported for contract tests (§9.2 move-fidelity). */
+export function defaultConstraints(move: MoveType): MoveConstraints {
+  const returnableMoves: MoveType[] = [
+    'REFLECTION', 'NAMING', 'CLARIFICATION', 'GENTLE_CHALLENGE', 'SUMMARY', 'RECONNECTION',
+  ]
+  const noAdviceMoves: MoveType[] = [
+    'REFLECTION', 'NAMING', 'HOLDING', 'CLARIFICATION', 'QUESTION',
+  ]
+  const halfStepMoves: MoveType[] = ['NAMING', 'GENTLE_CHALLENGE']
 
   const lengthMap: Record<MoveType, MoveConstraints['max_length_hint']> = {
     HOLDING: 'SHORT',
@@ -55,22 +55,54 @@ function defaultConstraints(move: MoveType): MoveConstraints {
   }
 
   return {
-    returnable: isReturnable,
+    returnable: returnableMoves.includes(move),
     use_user_vocabulary: true,
     no_diagnosis: true,
-    no_advice: noAdvice,
+    no_advice: noAdviceMoves.includes(move),
     max_length_hint: lengthMap[move],
-    half_step_only: isHalfStep,
+    half_step_only: halfStepMoves.includes(move),
   }
 }
 
-function extractUserPhrases(userText: string): string[] {
-  // Split on punctuation and return the first 2–3 meaningful clauses.
-  // These are the verbatim phrases the generator should build responses from.
-  return userText
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function get(signals: Signal[], type: SignalType): Signal | undefined {
+  return signals.find((s) => s.type === type)
+}
+
+function above(sig: Signal | undefined, value: number, confMin = 0.0): boolean {
+  return !!sig && sig.confidence >= confMin && sig.value > value
+}
+
+function below(sig: Signal | undefined, value: number, confMin = 0.0): boolean {
+  return !!sig && sig.confidence >= confMin && sig.value < value
+}
+
+/** Extract verbatim user phrases for focus_spans, picking emotionally salient clauses first. */
+function selectFocusSpans(userText: string): string[] {
+  const EMOTIONAL_WORDS = new Set([
+    'terrified', 'devastated', 'desperate', 'heartbroken', 'furious', 'crushed',
+    'overwhelmed', 'stuck', 'lost', 'invisible', 'broken', 'numb', 'grief',
+    'angry', 'scared', 'afraid', 'alone', 'empty', 'hopeless', 'tired', 'ashamed',
+    'confused', 'hurt', 'betrayed', 'jealous', 'guilty', 'ashamed',
+  ])
+
+  const clauses = userText
     .split(/[.!?;]/)
     .map((s) => s.trim())
     .filter((s) => s.length > 8)
+
+  // Score each clause: how many emotional words does it contain?
+  const scored = clauses.map((c) => {
+    const words = c.toLowerCase().split(/\s+/)
+    const score = words.filter((w) => EMOTIONAL_WORDS.has(w)).length
+    return { clause: c, score }
+  })
+
+  // Return top-scored first, then rest; max 3
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .map((s) => s.clause)
     .slice(0, 3)
 }
 
@@ -84,13 +116,13 @@ function buildDirective(
   return {
     move,
     constraints: defaultConstraints(move),
-    focus_spans: focusSpans ?? extractUserPhrases(userText),
+    focus_spans: focusSpans ?? selectFocusSpans(userText),
     rationale,
     alternatives_considered: alternatives,
   }
 }
 
-// ── Policy ────────────────────────────────────────────────────────────────────
+// ─── Policy ───────────────────────────────────────────────────────────────────
 
 export function selectMove(
   estimate: StateEstimate,
@@ -99,190 +131,193 @@ export function selectMove(
   userText: string
 ): MoveDirective {
   const { state, confidence } = estimate
-  const alternatives: AlternativeConsidered[] = []
+  const alts: AlternativeConsidered[] = []
 
-  const depth = getSignal(signals, 'DEPTH_VS_CIRCLING')
-  const concreteness = getSignal(signals, 'CONCRETENESS_VS_ABSTRACTION')
-  const affect = getSignal(signals, 'AFFECT_TRAJECTORY')
-  const correction = getSignal(signals, 'CORRECTION_DETECTED')
-  const feltShift = getSignal(signals, 'FELT_SHIFT_DETECTED')
-  const guardedness = getSignal(signals, 'GUARDEDNESS')
+  const depth = get(signals, 'DEPTH_VS_CIRCLING')
+  const concreteness = get(signals, 'CONCRETENESS_VS_ABSTRACTION')
+  const affect = get(signals, 'AFFECT_TRAJECTORY')
+  const correction = get(signals, 'CORRECTION_DETECTED')
+  const feltShift = get(signals, 'FELT_SHIFT_DETECTED')
+  const guardedness = get(signals, 'GUARDEDNESS')
 
-  // ── Rule 1: Safety overrides all ─────────────────────────────────────────
-  // Handled by the orchestrator *before* this function is called.
-  // HANDOFF is only emitted by the orchestrator on ESCALATION.
+  const aiTurns = history.filter((t) => t.speaker === 'AI')
+  const lastAiMove = aiTurns.length > 0 ? undefined : undefined // placeholder for move history
 
-  // ── Rule 2: Circling detected → REFLECTION or HOLDING (no excavation) ────
-  if (depth && depth.value < -0.3 && depth.confidence > 0.5) {
-    alternatives.push({
-      move: 'QUESTION',
-      reason_rejected: 'Circling detected — questions would excavate the loop further',
-    })
-    const move = affect && affect.value < -0.1 ? 'HOLDING' : 'REFLECTION'
+  // ── Rule 1: Safety overrides all ────────────────────────────────────────────
+  // Handled by orchestrator before this is called. HANDOFF → orchestrator only.
+
+  // ── Rule 2: Circling → REFLECTION or HOLDING (never excavate a loop) ────────
+  if (below(depth, -0.30, 0.55)) {
+    alts.push({ move: 'QUESTION', reason_rejected: 'Circling detected — questions excavate loops' })
+    const move = below(affect, -0.05) ? 'HOLDING' : 'REFLECTION'
     return buildDirective(
       move,
-      `Circling detected (depth ${depth.value.toFixed(2)}, conf ${depth.confidence.toFixed(2)}) — shift away from questions, hold or reflect without digging`,
-      alternatives,
+      `Circling (depth ${depth!.value.toFixed(2)}, conf ${(depth!.confidence * 100).toFixed(0)}%) — shift away from questions; ${move === 'HOLDING' ? 'closing affect too, so hold' : 'reflect without digging'}`,
+      alts,
       userText
     )
   }
 
-  // ── Rule 3: Abstract framing → steer concrete ─────────────────────────────
-  if (concreteness && concreteness.value < -0.4 && concreteness.confidence > 0.4) {
-    alternatives.push({
-      move: 'REFLECTION',
-      reason_rejected: 'Person in abstract frame — grounding needed before reflecting content',
-    })
-    // Persists across multiple turns → HOLDING / ORIENTATION (stop digging)
-    const abstractTurnCount = history
-      .filter((t) => t.speaker === 'AI')
-      .slice(-3).length // simplified: if we're 3 turns in and still abstract
-    if (abstractTurnCount >= 2) {
-      alternatives.push({
-        move: 'CLARIFICATION',
-        reason_rejected: 'Abstract framing persisting — time to stop excavating',
-      })
+  // ── Rule 3: Abstract framing → steer concrete ───────────────────────────────
+  if (below(concreteness, -0.35, 0.55)) {
+    alts.push({ move: 'REFLECTION', reason_rejected: 'Abstract frame — reflection without grounding reinforces the loop' })
+
+    // Persistent abstraction across several AI turns → stop excavating
+    const aiTurnCount = aiTurns.length
+    if (aiTurnCount >= 3) {
+      alts.push({ move: 'CLARIFICATION', reason_rejected: 'Abstract framing persisting — time to hold rather than dig' })
       return buildDirective(
         'HOLDING',
-        `Abstract framing persisting across turns (concreteness ${concreteness.value.toFixed(2)}) — stop digging per blueprint §5.2 rule 3`,
-        alternatives,
+        `Abstract framing persisting after ${aiTurnCount} turns (concreteness ${concreteness!.value.toFixed(2)}) — stop digging (§5.2 rule 3)`,
+        alts,
         userText
       )
     }
     return buildDirective(
       'CLARIFICATION',
-      `Abstract / evaluative framing (concreteness ${concreteness.value.toFixed(2)}) — invite concrete specifics`,
-      alternatives,
+      `Abstract / evaluative framing (concreteness ${concreteness!.value.toFixed(2)}) — invite specifics: when, where, what happened`,
+      alts,
       userText
     )
   }
 
-  // ── Rule 6: Correction detected → preserve it (checked early) ─────────────
-  // Blueprint: "Never smooth with 'you're absolutely right.' Treat as
-  // healthy deepening signal; reflect the corrected version."
-  if (correction && correction.value > 0.5 && correction.confidence > 0.5) {
-    alternatives.push({
-      move: 'VALIDATION',
-      reason_rejected: 'Correction detected — smoothing would erase the mechanism working',
-    })
+  // ── Rule 6: Correction detected → preserve; reflect the corrected version ───
+  // Checked early because it overrides most state-based logic.
+  if (above(correction, 0.50, 0.55)) {
+    alts.push({ move: 'VALIDATION', reason_rejected: 'Smoothing a correction erases the mechanism working — never "you\'re absolutely right"' })
     return buildDirective(
       'REFLECTION',
-      `Correction detected (${correction.value.toFixed(2)}) — reflect the corrected version without smoothing per §5.2 rule 6`,
-      alternatives,
+      `Correction detected (value ${correction!.value.toFixed(2)}, conf ${(correction!.confidence * 100).toFixed(0)}%) — reflect the corrected version without smoothing (§5.2 rule 6)`,
+      alts,
       userText
     )
   }
 
-  // ── Rule 7: Crystallizing → light summary ─────────────────────────────────
+  // ── Rule 7: Crystallising → light summary ───────────────────────────────────
   if (state === 'CRYSTALLIZING') {
-    alternatives.push({
-      move: 'REFLECTION',
-      reason_rejected: 'Crystallising moment — person deserves to hear their arrival, not just more reflection',
-    })
+    alts.push({ move: 'REFLECTION', reason_rejected: 'Arrival moment — person deserves to hear their own clarity, not just more reflection' })
     return buildDirective(
       'SUMMARY',
-      'Person crystallising — light summary so they hear their own arrival; clarity stays theirs',
-      alternatives,
+      'Person crystallising — light summary so they hear their own arrival; clarity stays theirs (§5.2 rule 7)',
+      alts,
       userText
     )
   }
 
-  // ── Rule 9: Payload delivered → ORIENTATION ───────────────────────────────
+  // ── Rule 9: Payload delivered → ORIENTATION, then EXIT ──────────────────────
   if (state === 'ORIENTING_OUTWARD') {
-    alternatives.push({
-      move: 'REFLECTION',
-      reason_rejected: 'Payload delivered — reflection would pull backward instead of forward',
-    })
+    // If we already gave ORIENTATION last turn, offer EXIT
+    const prevAiTexts = aiTurns.slice(-2).map((t) => t.text)
+    const alreadyOriented = prevAiTexts.some((t) =>
+      t.includes('carry forward') || t.includes('look like') || t.includes('What would')
+    )
+    if (alreadyOriented) {
+      alts.push({ move: 'ORIENTATION', reason_rejected: 'Already oriented last turn — time to exit cleanly' })
+      return buildDirective(
+        'EXIT',
+        'Person is orienting outward and already received an orientation move — exit cleanly (§5.2 rule 9)',
+        alts,
+        userText
+      )
+    }
+    alts.push({ move: 'REFLECTION', reason_rejected: 'Payload delivered — reflection pulls backward when person is ready to face outward' })
     return buildDirective(
       'ORIENTATION',
-      'Payload delivered; person is orienting outward — help bridge toward concrete next steps',
-      alternatives,
+      'Payload delivered; person is orienting outward — bridge toward concrete next steps (§5.2 rule 9)',
+      alts,
       userText
     )
   }
 
-  // ── Rule 10: Pain not wanting solving → HOLDING ───────────────────────────
+  // ── Rule 10: Pain not wanting solving → HOLDING ──────────────────────────────
   if (state === 'HOLDING') {
-    alternatives.push({
-      move: 'QUESTION',
-      reason_rejected: 'HOLDING state — questions are intrusive',
-    })
-    alternatives.push({
-      move: 'REFLECTION',
-      reason_rejected: 'HOLDING — no question attached; hold without excavating',
-    })
+    alts.push({ move: 'QUESTION', reason_rejected: 'HOLDING state — questions are intrusive' })
+    alts.push({ move: 'REFLECTION', reason_rejected: 'HOLDING — no question attached; presence over excavation' })
     return buildDirective(
       'HOLDING',
-      'Person needs presence, not excavation. A conversation may legitimately run ARRIVAL→HOLDING→EXIT with no clarity payload (blueprint §5.2 rule 10)',
-      alternatives,
+      'Person needs presence, not solutions. A conversation may legitimately run ARRIVAL→HOLDING→EXIT with no payload (§5.2 rule 10)',
+      alts,
       userText
     )
   }
 
-  // ── Rule 4 & 5: Person working + new content ──────────────────────────────
+  // ── Rules 4 & 5: Person working + new content ────────────────────────────────
   if (state === 'OPENING' || state === 'DEEPENING') {
-    if (depth && depth.value > 0.2) {
-      // Rule 4: bias to REFLECTION once genuinely working (§5.3 bias 2)
+    if (above(depth, 0.20, 0.45)) {
+      // Philosophy bias 2: reflection over interrogation once genuinely working
       if (state === 'DEEPENING') {
-        alternatives.push({
-          move: 'QUESTION',
-          reason_rejected: 'Person already working deeply — reflection preferred over stacking questions (§5.3 bias 2)',
-        })
+        alts.push({ move: 'QUESTION', reason_rejected: 'Person is already working deeply — stacking questions interrupts the process (§5.3 bias 2)' })
         return buildDirective(
           'REFLECTION',
-          `DEEPENING with rising novelty (depth ${depth.value.toFixed(2)}) — reflect rather than interrogate`,
-          alternatives,
+          `DEEPENING with rising novelty (depth ${depth!.value.toFixed(2)}) — reflect rather than interrogate`,
+          alts,
           userText
         )
       }
-      // OPENING: question is appropriate, built from their words
       return buildDirective(
         'QUESTION',
-        `OPENING with new content (depth ${depth.value.toFixed(2)}) — open question built from their words`,
-        alternatives,
+        `OPENING with new content (depth ${depth!.value.toFixed(2)}) — open question built from their words (§5.2 rule 4)`,
+        alts,
         userText
       )
     }
 
-    // Rule 5: specific material + trust → REFLECTION / NAMING
+    // Rule 5: specific material in DEEPENING → reflection / naming
     if (state === 'DEEPENING') {
-      alternatives.push({
-        move: 'QUESTION',
-        reason_rejected: 'Specific material offered in DEEPENING — reflection is more appropriate than more questions',
-      })
+      alts.push({ move: 'QUESTION', reason_rejected: 'Specific material offered in DEEPENING — one more question would interrogate rather than reflect' })
       return buildDirective(
         'REFLECTION',
-        'Specific material offered with established depth — reflect and be half a step ahead',
-        alternatives,
+        'Specific material offered with established depth — reflect, half a step ahead, returnable (§5.2 rule 5)',
+        alts,
         userText
       )
     }
   }
 
-  // ── Rule 8: GENTLE_CHALLENGE ──────────────────────────────────────────────
-  // Only from OPENING/DEEPENING with established trust, never on ARRIVAL
-  // (not auto-selected; included here for completeness — remove when we add
-  //  a trust/depth threshold gate)
+  // ── Rule 8: GENTLE_CHALLENGE ─────────────────────────────────────────────────
+  // Only from OPENING / DEEPENING with established trust; never on ARRIVAL.
+  // Not auto-selected in v1 — requires a trust/depth threshold gate not yet
+  // implemented. Excluded deliberately; included here as a marker.
 
-  // ── Philosophy bias 1: bias to exit under uncertainty ────────────────────
-  if (confidence < 0.5) {
-    alternatives.push({
-      move: 'QUESTION',
-      reason_rejected: `Low state confidence (${confidence.toFixed(2)}) — bias to safer move per §5.3 philosophy bias 1`,
-    })
+  // ── ARRIVAL: choose move based on context ────────────────────────────────────
+  if (state === 'ARRIVAL') {
+    // High guardedness at arrival → VALIDATION (warmth before depth)
+    if (above(guardedness, 0.50, 0.50)) {
+      alts.push({ move: 'QUESTION', reason_rejected: 'Person is guarded — a question may feel interrogating; validation first' })
+      return buildDirective(
+        'VALIDATION',
+        `ARRIVAL with high guardedness (${guardedness!.value.toFixed(2)}) — warm acknowledgment before any depth`,
+        alts,
+        userText
+      )
+    }
     return buildDirective(
-      'VALIDATION',
-      `Low state confidence (${confidence.toFixed(2)}) — bias to exit/slow rather than deepen; validation is the safest move`,
-      alternatives,
+      'QUESTION',
+      'ARRIVAL — open question built entirely from their words; no steered destination',
+      alts,
       userText
     )
   }
 
-  // ── Default for ARRIVAL: open question ────────────────────────────────────
+  // ── Philosophy bias 1: low confidence → safe move ──────────────────────────
+  if (confidence < 0.50) {
+    alts.push({
+      move: 'QUESTION',
+      reason_rejected: `Low state confidence (${confidence.toFixed(2)}) — §5.3 bias 1: when ambiguous, bias toward stopping rather than deepening`,
+    })
+    return buildDirective(
+      'VALIDATION',
+      `Low state confidence (${confidence.toFixed(2)}) — validation is the safest move under uncertainty`,
+      alts,
+      userText
+    )
+  }
+
+  // ── Fallback ──────────────────────────────────────────────────────────────────
   return buildDirective(
     'QUESTION',
-    'ARRIVAL state — open question to invite elaboration; built entirely from their words',
-    alternatives,
+    'No specific rule fired — open question as default (built from their words)',
+    alts,
     userText
   )
 }

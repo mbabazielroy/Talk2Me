@@ -41,6 +41,8 @@ export function logTurn(params: LogTurnParams): TurnTrace {
     signals: signalSet.signals,
     inferred_state: stateEstimate.state,
     state_confidence: stateEstimate.confidence,
+    signals_used: stateEstimate.signals_used,
+    state_rationale: stateEstimate.rationale,
   }
 
   const moveDecision: MoveDecision = {

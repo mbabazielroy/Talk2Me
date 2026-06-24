@@ -1,122 +1,153 @@
 /**
- * State Estimator — maps SignalSet + history → { state, confidence }.
+ * State Estimator v1 — maps SignalSet + history → StateEstimate.
  *
- * Blueprint §4: "Design stance for v1: transparent and heuristic. Start
- * rule-based so it is debuggable and auditable against the philosophy.
- * Designed to be replaced by a learned model once the lab produces labels —
- * but only against honest targets."
+ * Blueprint §4: "Transparent and heuristic. Designed to be replaced by a
+ * learned model once the lab produces labels — but only against honest targets."
  *
- * States are regions, not stages. People move backward. A new thread can
- * drop someone from CRYSTALLIZING back to OPENING. The estimator must allow
- * that and the policy must not treat it as regression.
+ * States are REGIONS, not stages. People move backward. The estimator allows
+ * that and the policy must not treat backward movement as regression.
  *
- * Confidence is load-bearing: "when ambiguous between deepen and exit,
- * bias to exit" is a direct function of it (blueprint §5.3).
+ * Confidence is load-bearing: it feeds directly into the philosophy bias
+ * "when ambiguous between deepen and exit, bias to exit" (§5.3).
+ *
+ * signals_used: which signals drove the decision. Essential for the lab
+ * to understand and evaluate the estimator independently.
  */
 
-import type { ConversationState, Signal, SignalSet, Turn } from '@/types/domain'
+import type { ConversationState, Signal, SignalSet, SignalType, Turn } from '@/types/domain'
 
 export interface StateEstimate {
   state: ConversationState
   confidence: number
-  reasoning: string
+  rationale: string
+  signals_used: SignalType[]
 }
 
-function getSignal(signals: Signal[], type: Signal['type']): Signal | undefined {
+function get(signals: Signal[], type: SignalType): Signal | undefined {
   return signals.find((s) => s.type === type)
+}
+
+/** Returns true if a signal exists, has confidence above threshold, and value above min. */
+function above(sig: Signal | undefined, value: number, confMin = 0.0): boolean {
+  return !!sig && sig.confidence >= confMin && sig.value > value
+}
+
+/** Returns true if a signal exists, has confidence above threshold, and value below max. */
+function below(sig: Signal | undefined, value: number, confMin = 0.0): boolean {
+  return !!sig && sig.confidence >= confMin && sig.value < value
 }
 
 export function estimateState(signalSet: SignalSet, history: Turn[]): StateEstimate {
   const { signals } = signalSet
   const userTurns = history.filter((t) => t.speaker === 'USER')
-  const turnIndex = userTurns.length // 0 = first user turn
+  const turnIndex = userTurns.length // 0 = first user turn in THIS conversation
 
-  const depth = getSignal(signals, 'DEPTH_VS_CIRCLING')
-  const concreteness = getSignal(signals, 'CONCRETENESS_VS_ABSTRACTION')
-  const affect = getSignal(signals, 'AFFECT_TRAJECTORY')
-  const correction = getSignal(signals, 'CORRECTION_DETECTED')
-  const feltShift = getSignal(signals, 'FELT_SHIFT_DETECTED')
-  const guardedness = getSignal(signals, 'GUARDEDNESS')
+  const depth = get(signals, 'DEPTH_VS_CIRCLING')
+  const concreteness = get(signals, 'CONCRETENESS_VS_ABSTRACTION')
+  const affect = get(signals, 'AFFECT_TRAJECTORY')
+  const correction = get(signals, 'CORRECTION_DETECTED')
+  const feltShift = get(signals, 'FELT_SHIFT_DETECTED')
+  const guardedness = get(signals, 'GUARDEDNESS')
 
-  // ── Rule 1: ARRIVAL (first turn or high guardedness) ─────────────────────
-  if (turnIndex === 0 || (guardedness && guardedness.value > 0.6 && turnIndex < 3)) {
+  // ── Rule 1: ARRIVAL ─────────────────────────────────────────────────────────
+  // First turn: always ARRIVAL, high confidence.
+  if (turnIndex === 0) {
     return {
       state: 'ARRIVAL',
-      confidence: turnIndex === 0 ? 0.9 : 0.65,
-      reasoning:
-        turnIndex === 0
-          ? 'First user turn — defaulting to ARRIVAL'
-          : `High guardedness (${guardedness!.value.toFixed(2)}) in early turns`,
+      confidence: 0.90,
+      rationale: 'First user turn — always ARRIVAL',
+      signals_used: [],
     }
   }
 
-  // ── Rule 2: CRYSTALLIZING (felt shift + new content) ─────────────────────
-  if (
-    feltShift && feltShift.value > 0.7 && feltShift.confidence > 0.6 &&
-    depth && depth.value > 0.1 // must have some new content, not just agreement
-  ) {
+  // Early turns with high guardedness: still in ARRIVAL.
+  if (turnIndex <= 2 && above(guardedness, 0.55, 0.50)) {
+    return {
+      state: 'ARRIVAL',
+      confidence: 0.70,
+      rationale: `High guardedness (${guardedness!.value.toFixed(2)}) in early turn — person hasn't yet settled in`,
+      signals_used: ['GUARDEDNESS'],
+    }
+  }
+
+  // ── Rule 2: CRYSTALLIZING ────────────────────────────────────────────────────
+  // Felt shift + substantive new content. NOT just agreement-without-movement.
+  if (above(feltShift, 0.65, 0.65) && above(depth, 0.05)) {
     return {
       state: 'CRYSTALLIZING',
-      confidence: 0.75,
-      reasoning: `Felt-shift detected (${feltShift.value.toFixed(2)}) with new content — person has arrived somewhere`,
+      confidence: 0.78,
+      rationale: `Felt-shift detected (${feltShift!.value.toFixed(2)}) with new content (depth ${depth!.value.toFixed(2)}) — person has arrived somewhere`,
+      signals_used: ['FELT_SHIFT_DETECTED', 'DEPTH_VS_CIRCLING'],
     }
   }
 
-  // ── Rule 3: HOLDING (circling + closing affect) ───────────────────────────
-  if (
-    depth && depth.value < -0.3 &&
-    affect && affect.value < -0.1
-  ) {
+  // ── Rule 3: HOLDING ──────────────────────────────────────────────────────────
+  // Circling + closing affect. Pain that doesn't want solving.
+  // Also fires on heavy circling alone (depth very negative).
+  if (below(depth, -0.35, 0.55)) {
+    const withClosing = below(affect, -0.05)
     return {
       state: 'HOLDING',
-      confidence: 0.65,
-      reasoning: `Circling detected (depth ${depth.value.toFixed(2)}) with closing affect (${affect.value.toFixed(2)})`,
+      confidence: withClosing ? 0.72 : 0.62,
+      rationale: withClosing
+        ? `Circling (depth ${depth!.value.toFixed(2)}) with closing affect (${affect?.value.toFixed(2)}) — person needs presence, not excavation`
+        : `Strong circling signal (depth ${depth!.value.toFixed(2)}) — do not dig deeper`,
+      signals_used: withClosing
+        ? ['DEPTH_VS_CIRCLING', 'AFFECT_TRAJECTORY']
+        : ['DEPTH_VS_CIRCLING'],
     }
   }
 
-  // ── Rule 4: ORIENTING_OUTWARD (crystallized + forward language) ──────────
-  // Check previous traces for CRYSTALLIZING state
-  const prevUserWords = userTurns.slice(-1)[0]?.text.toLowerCase() ?? ''
-  const forwardMarkers = ['want to', 'going to', 'will', 'next', 'plan', 'try', 'start', 'take']
-  const forwardCount = forwardMarkers.filter((m) => prevUserWords.includes(m)).length
-  if (forwardCount >= 2 && turnIndex >= 4) {
+  // ── Rule 4: ORIENTING_OUTWARD ────────────────────────────────────────────────
+  // Forward-looking language in mid-to-late session.
+  const currentText = userTurns.slice(-1)[0]?.text.toLowerCase() ?? ''
+  const forwardPhrases = [
+    'want to', 'going to', "i'll", 'will try', 'plan to', 'next week',
+    'this week', 'tomorrow', 'going to try', 'start', 'begin', 'commit',
+    'take that', 'bring that', 'do that',
+  ]
+  const forwardHits = forwardPhrases.filter((p) => currentText.includes(p))
+  if (forwardHits.length >= 2 && turnIndex >= 4) {
     return {
       state: 'ORIENTING_OUTWARD',
-      confidence: 0.6,
-      reasoning: `Forward-looking language detected (${forwardCount} markers) in later session`,
+      confidence: 0.65,
+      rationale: `Forward-looking language in turn ${turnIndex + 1}: "${forwardHits.slice(0, 2).join('", "')}"`,
+      signals_used: [],
     }
   }
 
-  // ── Rule 5: DEEPENING (rising novelty + concrete language + established trust) ──
+  // ── Rule 5: DEEPENING ────────────────────────────────────────────────────────
+  // Rising novelty + not strongly abstract + at least 3 prior turns.
   if (
     turnIndex >= 3 &&
-    depth && depth.value > 0.3 &&
-    concreteness && concreteness.value > -0.2
+    above(depth, 0.25, 0.50) &&
+    !below(concreteness, -0.35, 0.55)  // not deeply abstract
   ) {
     return {
       state: 'DEEPENING',
-      confidence: 0.65,
-      reasoning: `Rising novelty (depth ${depth.value.toFixed(2)}) with concrete language in mid-session`,
+      confidence: 0.68,
+      rationale: `Rising novelty (depth ${depth!.value.toFixed(2)}) with sufficient concreteness (${concreteness?.value.toFixed(2) ?? 'n/a'}) in turn ${turnIndex + 1}`,
+      signals_used: ['DEPTH_VS_CIRCLING', 'CONCRETENESS_VS_ABSTRACTION'],
     }
   }
 
-  // ── Rule 6: OPENING (some novelty, guardedness dropping) ─────────────────
-  if (
-    turnIndex >= 1 &&
-    depth && depth.value > 0 &&
-    (!guardedness || guardedness.value < 0.5)
-  ) {
+  // ── Rule 6: OPENING ──────────────────────────────────────────────────────────
+  // Some novelty, guardedness not dominant.
+  if (above(depth, 0.05) && !above(guardedness, 0.55)) {
     return {
       state: 'OPENING',
-      confidence: 0.6,
-      reasoning: `Novelty rising (${depth.value.toFixed(2)}) and guardedness low — person is opening`,
+      confidence: 0.62,
+      rationale: `Novelty rising (depth ${depth!.value.toFixed(2)}), guardedness manageable (${guardedness?.value.toFixed(2) ?? 'n/a'}) — person is opening`,
+      signals_used: ['DEPTH_VS_CIRCLING', 'GUARDEDNESS'],
     }
   }
 
-  // ── Default: ARRIVAL with low confidence (when unsure, slow down) ─────────
+  // ── Default: ARRIVAL at low confidence ──────────────────────────────────────
+  // Philosophy: when in doubt, slow down / bias to exit.
   return {
     state: 'ARRIVAL',
     confidence: 0.35,
-    reasoning: 'No clear state signal — defaulting to ARRIVAL with low confidence (philosophy: when in doubt, slow down)',
+    rationale: 'No clear state signal — defaulting to ARRIVAL with low confidence (philosophy §5.3: when in doubt, slow down)',
+    signals_used: [],
   }
 }

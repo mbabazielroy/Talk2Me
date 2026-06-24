@@ -61,6 +61,9 @@ export interface Signal {
   confidence: number
   /** Verbatim substrings from the user message that drove this signal. */
   evidence_spans: string[]
+  /** Human-readable explanation of why this extractor produced this value.
+   *  Logged in every trace; shown in the Trace Viewer. */
+  rationale: string
 }
 
 export interface SignalSet {
@@ -122,6 +125,10 @@ export interface TurnAnalysis {
   signals: Signal[]
   inferred_state: ConversationState
   state_confidence: number
+  /** Which signals most influenced the state decision. */
+  signals_used: SignalType[]
+  /** Why the state estimator chose this state. */
+  state_rationale: string
 }
 
 export interface MoveDecision {
